@@ -2,3 +2,4 @@ student_resource/dataset/
 *.DS_Store
 __pycache__/
 venv/
+data/
