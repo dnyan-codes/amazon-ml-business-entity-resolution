@@ -3,3 +3,15 @@ student_resource/dataset/
 __pycache__/
 venv/
 data/
+# Challenge datasets
+dataset/*.tsv
+
+# Validation split generated locally
+data/*.tsv
+
+# Generated outputs
+output/*.tsv
+
+# Trained models
+models/*.pkl
+models/*.joblib
