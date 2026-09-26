@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 import re
+import unicodedata
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List, Mapping, Sequence, Tuple
 
 from rapidfuzz import fuzz
@@ -18,9 +20,12 @@ def normalize_text(value: object) -> str:
     if value is None:
         return ""
 
-    text = str(value).strip().lower()
+    raw_text = str(value).strip()
+    if raw_text.lower() in {"nan", "<na>"}:
+        return ""
+    text = unicodedata.normalize("NFKC", raw_text).lower()
     text = text.replace("&", " and ")
-    text = re.sub(r"[^a-z0-9]+", " ", text)
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -53,68 +58,177 @@ def _length_difference(a: object, b: object) -> int:
     return abs(len(normalize_text(a)) - len(normalize_text(b)))
 
 
-def generate_pair_features(source1_record: Mapping[str, object], candidate_record: Mapping[str, object]) -> Dict[str, float | int]:
-    """Generate pairwise similarity features for one source1/candidate pair."""
-    s1_name = source1_record.get("business_name", "")
-    cand_name = candidate_record.get("business_name", "")
-    s1_address = source1_record.get("business_address", "")
-    cand_address = candidate_record.get("business_address", "")
-    s1_country = source1_record.get("country", "")
-    cand_country = candidate_record.get("country", "")
-
-    s1_name_norm = normalize_text(s1_name)
-    cand_name_norm = normalize_text(cand_name)
-    s1_addr_norm = normalize_text(s1_address)
-    cand_addr_norm = normalize_text(cand_address)
-
-    features: Dict[str, float | int] = {
-        "name_exact_match": _exact_match(s1_name, cand_name),
-        "address_exact_match": _exact_match(s1_address, cand_address),
-        "country_exact_match": 1 if str(s1_country).strip().lower() == str(cand_country).strip().lower() and str(s1_country).strip() else 0,
-        "name_fuzz_ratio": fuzz.ratio(s1_name_norm, cand_name_norm),
-        "name_partial_ratio": fuzz.partial_ratio(s1_name_norm, cand_name_norm),
-        "name_token_sort_ratio": fuzz.token_sort_ratio(s1_name_norm, cand_name_norm),
-        "name_token_set_ratio": fuzz.token_set_ratio(s1_name_norm, cand_name_norm),
-        "address_fuzz_ratio": fuzz.ratio(s1_addr_norm, cand_addr_norm),
-        "address_partial_ratio": fuzz.partial_ratio(s1_addr_norm, cand_addr_norm),
-        "address_token_sort_ratio": fuzz.token_sort_ratio(s1_addr_norm, cand_addr_norm),
-        "address_token_set_ratio": fuzz.token_set_ratio(s1_addr_norm, cand_addr_norm),
-        "name_length_difference": _length_difference(s1_name, cand_name),
-        "address_length_difference": _length_difference(s1_address, cand_address),
-        "name_token_overlap": _token_overlap(s1_name, cand_name),
-        "address_token_overlap": _token_overlap(s1_address, cand_address),
-        "exact_normalized_name": 1 if s1_name_norm and s1_name_norm == cand_name_norm else 0,
-        "exact_normalized_address": 1 if s1_addr_norm and s1_addr_norm == cand_addr_norm else 0,
-    }
-    return features
+def _token_count_difference(a: object, b: object) -> int:
+    return abs(_token_count(a) - _token_count(b))
 
 
-def load_candidate_pairs(path: str) -> List[Tuple[str, str]]:
-    """Read the future Member 1 candidate-pair file.
+def _containment(a: str, b: str) -> int:
+    return int(bool(a and b and (a in b or b in a)))
 
-    Expected output schema:
-      source1_entity_id <tab> candidate_entity_ids
 
-    candidate_entity_ids is comma-separated, possibly empty.
-    """
-    rows: List[Tuple[str, str]] = []
+def _edge_token_agreement(a: object, b: object, last: bool = False) -> int:
+    tokens_a = _safe_tokens(a)
+    tokens_b = _safe_tokens(b)
+    if not tokens_a or not tokens_b:
+        return 0
+    return int((tokens_a[-1] == tokens_b[-1]) if last else (tokens_a[0] == tokens_b[0]))
+
+
+FEATURE_COLUMNS = (
+    "name_exact_match",
+    "address_exact_match",
+    "country_exact_match",
+    "country_mismatch",
+    "source1_country_missing",
+    "candidate_country_missing",
+    "name_fuzz_ratio",
+    "name_partial_ratio",
+    "name_token_sort_ratio",
+    "name_token_set_ratio",
+    "address_fuzz_ratio",
+    "address_partial_ratio",
+    "address_token_sort_ratio",
+    "address_token_set_ratio",
+    "name_length_difference",
+    "address_length_difference",
+    "name_token_count_difference",
+    "address_token_count_difference",
+    "name_token_overlap",
+    "address_token_overlap",
+    "name_containment",
+    "address_containment",
+    "name_first_token_match",
+    "name_last_token_match",
+    "exact_normalized_name",
+    "exact_normalized_address",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedRecord:
+    name: str
+    address: str
+    country: str
+    name_tokens: Tuple[str, ...]
+    address_tokens: Tuple[str, ...]
+    name_token_set: frozenset[str]
+    address_token_set: frozenset[str]
+
+
+def prepare_normalized_record(
+    name: str,
+    address: str,
+    country: str,
+    name_tokens: str | None = None,
+    address_tokens: str | None = None,
+) -> PreparedRecord:
+    """Prepare cached token data from normalized fields, optionally stored tokens."""
+    prepared_name_tokens = tuple((name_tokens if name_tokens is not None else name).split())
+    prepared_address_tokens = tuple(
+        (address_tokens if address_tokens is not None else address).split()
+    )
+    return PreparedRecord(
+        name=name,
+        address=address,
+        country=country,
+        name_tokens=prepared_name_tokens,
+        address_tokens=prepared_address_tokens,
+        name_token_set=frozenset(prepared_name_tokens),
+        address_token_set=frozenset(prepared_address_tokens),
+    )
+
+
+def prepare_record(record: Mapping[str, object]) -> PreparedRecord:
+    """Normalize and tokenize one entity record for reuse across its pairs."""
+    return prepare_normalized_record(
+        normalize_text(record.get("business_name", "")),
+        normalize_text(record.get("business_address", "")),
+        normalize_text(record.get("country", "")),
+    )
+
+
+def _prepared_token_overlap(tokens_a: frozenset[str], tokens_b: frozenset[str]) -> float:
+    if not tokens_a or not tokens_b:
+        return 0.0
+    smaller, larger = (tokens_a, tokens_b) if len(tokens_a) <= len(tokens_b) else (tokens_b, tokens_a)
+    intersection = sum(token in larger for token in smaller)
+    union = len(tokens_a) + len(tokens_b) - intersection
+    return intersection / union if union else 0.0
+
+
+def generate_pair_feature_values(
+    source1: PreparedRecord, candidate: PreparedRecord
+) -> Tuple[float | int, ...]:
+    """Return features in FEATURE_COLUMNS order without per-pair dict allocation."""
+    name_exact = int(bool(source1.name and source1.name == candidate.name))
+    address_exact = int(bool(source1.address and source1.address == candidate.address))
+    country_exact = int(bool(source1.country and source1.country == candidate.country))
+
+    return (
+        name_exact,
+        address_exact,
+        country_exact,
+        int(bool(source1.country and candidate.country and not country_exact)),
+        int(not source1.country),
+        int(not candidate.country),
+        fuzz.ratio(source1.name, candidate.name),
+        fuzz.partial_ratio(source1.name, candidate.name),
+        fuzz.token_sort_ratio(source1.name, candidate.name),
+        fuzz.token_set_ratio(source1.name, candidate.name),
+        fuzz.ratio(source1.address, candidate.address),
+        fuzz.partial_ratio(source1.address, candidate.address),
+        fuzz.token_sort_ratio(source1.address, candidate.address),
+        fuzz.token_set_ratio(source1.address, candidate.address),
+        abs(len(source1.name) - len(candidate.name)),
+        abs(len(source1.address) - len(candidate.address)),
+        abs(len(source1.name_tokens) - len(candidate.name_tokens)),
+        abs(len(source1.address_tokens) - len(candidate.address_tokens)),
+        _prepared_token_overlap(source1.name_token_set, candidate.name_token_set),
+        _prepared_token_overlap(source1.address_token_set, candidate.address_token_set),
+        _containment(source1.name, candidate.name),
+        _containment(source1.address, candidate.address),
+        int(bool(source1.name_tokens and candidate.name_tokens and source1.name_tokens[0] == candidate.name_tokens[0])),
+        int(bool(source1.name_tokens and candidate.name_tokens and source1.name_tokens[-1] == candidate.name_tokens[-1])),
+        name_exact,
+        address_exact,
+    )
+
+
+def generate_pair_features(
+    source1_record: Mapping[str, object], candidate_record: Mapping[str, object]
+) -> Dict[str, float | int]:
+    """Generate the compatible feature mapping for one source1/candidate pair."""
+    values = generate_pair_feature_values(
+        prepare_record(source1_record), prepare_record(candidate_record)
+    )
+    return dict(zip(FEATURE_COLUMNS, values))
+
+
+def iter_candidate_pairs(path: str) -> Iterator[Tuple[str, str]]:
+    """Yield candidate pairs from Member 1's grouped TSV without retaining them."""
     with open(path, "r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         required = {"source1_entity_id", "candidate_entity_ids"}
         actual = set((reader.fieldnames or []))
         if not required.issubset(actual):
-            missing = sorted(required - actual)
-            raise ValueError(f"Candidate file missing required columns: {missing}")
+            raise ValueError(f"Candidate file missing required columns: {sorted(required - actual)}")
 
         for row in reader:
             source1_id = str(row.get("source1_entity_id", "")).strip()
             if not source1_id:
                 continue
             raw_candidates = row.get("candidate_entity_ids", "") or ""
-            candidates = [candidate.strip() for candidate in str(raw_candidates).split(",") if candidate.strip()]
-            for candidate_id in candidates:
-                rows.append((source1_id, candidate_id))
-    return rows
+            seen: set[str] = set()
+            for raw_candidate in str(raw_candidates).split(","):
+                candidate_id = raw_candidate.strip()
+                if candidate_id and candidate_id not in seen:
+                    seen.add(candidate_id)
+                    yield source1_id, candidate_id
+
+
+def load_candidate_pairs(path: str) -> List[Tuple[str, str]]:
+    """Compatibility helper; prefer iter_candidate_pairs for large files."""
+    return list(iter_candidate_pairs(path))
 
 
 def candidate_pairs_to_map(path: str) -> Dict[str, List[str]]:
@@ -141,8 +255,9 @@ def build_pair_labels(candidate_pairs: Iterable[Tuple[str, str]], ground_truth_m
     otherwise 0. This allows zero, one, or multiple true matches per source1.
     """
     labels: List[Tuple[str, str, int]] = []
+    truth_sets = {key: set(value) for key, value in ground_truth_map.items()}
     for source1_id, candidate_id in candidate_pairs:
-        true_ids = set(ground_truth_map.get(source1_id, []))
+        true_ids = truth_sets.get(source1_id, set())
         label = 1 if candidate_id in true_ids else 0
         labels.append((source1_id, candidate_id, label))
     return labels
